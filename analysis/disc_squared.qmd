@@ -1,0 +1,450 @@
+---
+title: "disc_disc_analysis"
+format: html
+editor: visual
+---
+
+## Libraries
+
+```{r}
+
+library(readr)
+library(here)
+library(ggalt)
+library(janitor)
+library(tidyverse)
+library(patchwork)
+library(jsonlite)
+library(fs)
+library(glue)
+
+```
+
+## Read Data
+
+```{r}
+
+jy_c102 <- read_csv("jy_c102.csv")
+
+parse_custom_json <- function(json_text) {
+  json_text_fixed <- gsub("NaN", "null", json_text)
+  fromJSON(json_text_fixed)
+}
+
+json_file <- "yuck.json"
+json_text <- readLines(json_file, warn = FALSE)
+json_text <- paste(json_text, collapse = "")
+data <- parse_custom_json(json_text)
+
+iter_data <- function(df){
+  iterations <- length(df[["lblp_lower"]])
+  results_df <- tibble(iteration = 1:iterations)
+  
+  simple_arrays <- c("lblp_lower", "did_compress", "lp_time_compress", 
+                     "lp_time_LB", "lp_value_compress", 
+                     "sum_lp_value_project", "sum_lp_time_project")
+  
+  for (array_name in simple_arrays) {
+    if (array_name %in% names(df) && length(df[[array_name]]) == iterations) {
+      results_df[[array_name]] <- df[[array_name]]
+    }
+  }
+  
+  prob_sizes <- df[["prob_sizes_at_start"]] |> as_tibble() |> 
+    rename(prob_size_time=timeGraph,
+           prob_size_cap=capGraph)
+  results_df <- results_df |> add_column(prob_sizes)
+  
+  lp_time <- df[["lp_time_project"]] |> as_tibble() |> 
+    rename(lp_time_time=timeGraph,
+           lp_time_cap=capGraph)
+  results_df <- results_df |> add_column(lp_time)
+  
+  lp_value <- df[["lp_value_project"]] |> as_tibble() |> 
+    rename(lp_value_time=timeGraph,
+           lp_value_cap=capGraph)
+  results_df <- results_df |> add_column(lp_value)
+  
+  results_df
+}
+
+```
+
+## Data From Each Iteration
+
+```{r}
+
+df <- iter_data(data)
+
+
+#write_csv(results_df, "optimization_iterations.csv")
+
+lb_graph <- df |> ggplot(aes(x = iteration, y = lblp_lower)) +
+  geom_line(color = "blue") +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "Lower Bound Progress Across Iterations",
+    x = "Iteration",
+    y = "Lower Bound (lblp_lower)"
+  )
+
+size_graph <- df |> select(iteration, prob_size_time, prob_size_cap) |>
+  rename(Time=prob_size_time, Capacity=prob_size_cap) |> 
+  pivot_longer(cols = c(Time, Capacity), names_to = "type", values_to = "value") |>
+  ggplot(aes(x = iteration, y = value, color=type)) +
+  geom_line() +
+  theme_minimal() +
+  theme(legend.title=element_blank()) +
+  labs(
+    title = "Problem Size Across Iterations",
+    x = "Iteration",
+    y = "Problem Size",
+    caption = "Data from Discretization Discovery Algorithm"
+  )
+
+lb_graph + size_graph + plot_layout(ncol=1)
+
+
+```
+
+## Final Graph
+
+```{r}
+
+final_cap_graph <- data[["final_graph_node_2_agg_node"]][["capGraph"]] |> 
+  stack() |> 
+  mutate(
+    node = as.numeric(str_sub(values,14,-2)),
+    node = factor(node)
+  ) |> 
+  select(node,ind) |> 
+  mutate(
+    ind = as.character(ind)|> str_replace_all("\\(",""),
+    ind = as.character(ind)|> str_replace_all("\\)","")
+  ) |> 
+  separate_wider_delim(ind, delim = ",", names = c("customer", "startCap", "endCap")) |> 
+  mutate(
+    customer = as.numeric(customer),
+    startCap = as.numeric(startCap),
+    endCap = as.numeric(endCap)
+  )
+
+final_time_graph <- data[["final_graph_node_2_agg_node"]][["timeGraph"]] |> 
+  stack() |> 
+  mutate(
+    node = as.numeric(str_sub(values,15,-2)),
+    node = factor(node)
+  ) |> 
+  select(node,ind) |> 
+  mutate(
+    ind = as.character(ind)|> str_replace_all("\\(",""),
+    ind = as.character(ind)|> str_replace_all("\\)","")
+  ) |> 
+  separate_wider_delim(ind, delim = ",", names = c("customer", "endTime", "startTime")) |> 
+  mutate(
+    customer = as.integer(customer),
+    startTime = as.integer(startTime),
+    endTime = as.integer(endTime)
+  ) |> 
+  select(node,customer,startTime,endTime) |> 
+#  filter(node>=0) |> 
+  arrange(node,customer,desc(startTime))
+
+final_time_graph |> tabyl(node)
+
+grouped_time_graph <- final_time_graph |> 
+  group_by(node,customer) |> 
+  summarise(
+    startTime = max(startTime),
+    endTime = min(endTime)
+  ) |> 
+  arrange(node,customer,desc(startTime))
+
+windows <- jy_c102 |> select(customer,ready_time,due_date) |> 
+  mutate(ready_time=as.integer(ready_time),
+         due_date=as.integer(due_date))
+
+customer_time_graph <- grouped_time_graph |> 
+  left_join(jy_c102, by="customer") |> 
+  mutate(in_window = startTime >= due_date & endTime <= ready_time)|> 
+  arrange(customer,desc(startTime))
+
+location_time_graph <- grouped_time_graph |> left_join(jy_c102, by="customer") |> 
+  mutate(in_window = startTime >= due_date & endTime <= ready_time)
+
+location_time_graph |> tabyl(node, in_window)
+
+location_time_graph |> ggplot(aes(x=xcoord,y=ycoord,color=node,shape = node, size=3)) +
+  scale_shape_manual(values=1:nlevels(location_time_graph$node)) +
+  geom_point()
+
+
+```
+
+## Plots
+
+```{r}
+
+jy_c102 |> filter(customer<25) |>
+  ggplot(aes(x=xcoord,y=ycoord)) + 
+  geom_point() +
+  geom_label(aes(label=customer))
+
+
+```
+
+
+
+
+```{r}
+
+library(ggalt)
+
+customer_time_graph %>%
+  ggplot(
+    aes(
+      x = startTime,
+      xend = endTime,
+      y = customer,
+      color = node
+    )
+  ) +
+  geom_dumbbell(
+#    colour = "#a3c4dc",
+#    colour_xend = "#0e668b",
+    size = 2
+  )
+
+
+```
+
+```{r}
+
+
+
+customer_time_graph  |> 
+  left_join(windows) |> 
+  filter(customer<25) |> 
+  ggplot(
+    aes(
+      x = startTime,
+      xend = endTime,
+      y = customer,
+      color = node
+    )
+  ) +
+  geom_dumbbell(
+    #    colour = "#a3c4dc",
+    #    colour_xend = "#0e668b",
+    size = 2
+  ) +
+#  scale_shape_binned() +
+  geom_point(aes(x=due_date,y=customer)) +
+    geom_point(aes(x=ready_time,y=customer)) +
+  scale_x_reverse()
+
+
+```
+
+## Process Julian Files
+
+### Iteration Data
+
+```{r}
+
+iter_data_ng <- function(df){
+  iterations <- length(df[["lblp_lower"]])
+  results_df <- tibble(iteration = 1:iterations)
+  
+  simple_arrays <- c("lblp_lower", "did_compress", "lp_time_compress", 
+                     "lp_time_LB", "lp_value_compress", 
+                     "sum_lp_value_project", "sum_lp_time_project")
+  
+  for (array_name in simple_arrays) {
+    if (array_name %in% names(df) && length(df[[array_name]]) == iterations) {
+      results_df[[array_name]] <- df[[array_name]]
+    }
+  }
+  
+  prob_sizes <- df[["prob_sizes_at_start"]] |> as_tibble() |> 
+    rename(prob_size_time=timeGraph,
+           #prob_size_cap=capGraph,
+           prob_size_ng=ngGraph)
+  results_df <- results_df |> add_column(prob_sizes)
+  
+  lp_time <- df[["lp_time_project"]] |> as_tibble() |> 
+    rename(lp_time_time=timeGraph,
+           #lp_time_cap=capGraph,
+           lp_time_ng=ngGraph)
+  results_df <- results_df |> add_column(lp_time)
+  
+  lp_value <- df[["lp_value_project"]] |> as_tibble() 
+  results_df <- results_df |> add_column(lp_value)
+  
+  results_df
+}
+
+```
+
+### Time Graph
+
+```{r}
+
+retrieve_time_graph <- function(data) {
+  
+  data[["final_graph_node_2_agg_node"]][["timeGraph"]] |> 
+    stack() |> 
+    mutate(
+      node = as.numeric(str_sub(values,15,-2)),
+      node = factor(node)
+    ) |> 
+    select(node,ind) |> 
+    mutate(
+      ind = as.character(ind)|> str_replace_all("\\(",""),
+      ind = as.character(ind)|> str_replace_all("\\)","")
+    ) |> 
+    separate_wider_delim(ind, delim = ",", names = c("customer", "endTime", "startTime")) |> 
+    mutate(
+      customer = as.integer(customer),
+      startTime = as.integer(startTime),
+      endTime = as.integer(endTime)
+    ) |> 
+    select(node,customer,startTime,endTime) |> 
+    group_by(node,customer) |> 
+    summarise(
+      startTime = max(startTime),
+      endTime = min(endTime)
+    ) |>  
+    arrange(node,customer,desc(startTime))
+  
+}
+
+customer_graph <- function(time_graph) {
+  time_graph |> arrange(customer,desc(startTime)) |> 
+    select(customer,node,everything())
+}
+
+
+
+```
+
+### NG Graph
+
+```{r}
+
+retrieve_ng_graph <- function(data) {
+  
+  data[["final_graph_node_2_agg_node"]][["ngGraph"]] |> 
+    stack() |> 
+    mutate(
+      node = as.numeric(str_sub(values,13,-2)),
+      node = factor(node),
+      ind = as.character(ind),
+      findcomma = str_locate(ind,",") |> as_tibble() |> pull(start),
+      customer = str_sub(ind,2,findcomma-1) |> as.numeric(),
+      ng_neighbors = str_sub(ind,findcomma+2,-2)
+    ) |> 
+    select(node,customer,ng_neighbors) #|> 
+    # mutate(
+    #   ind = as.character(ind)|> str_replace_all("\\(",""),
+    #   ind = as.character(ind)|> str_replace_all("\\)","")
+    # ) |> 
+    # separate_wider_delim(ind, delim = ",", names = c("customer", "endTime", "startTime")) |> 
+    # mutate(
+    #   customer = as.integer(customer),
+    #   startTime = as.integer(startTime),
+    #   endTime = as.integer(endTime)
+    # ) |> 
+    # select(node,customer,startTime,endTime) |> 
+    # group_by(node,customer) |> 
+    # summarise(
+    #   startTime = max(startTime),
+    #   endTime = min(endTime)
+    # ) |>  
+    #arrange(node,customer)
+  
+}
+
+```
+
+
+### Download Tools
+
+```{r}
+
+parse_custom_json <- function(json_text) {
+  json_text_fixed <- gsub("NaN", "null", json_text)
+  fromJSON(json_text_fixed)
+}
+
+read_one_file <- function(fname) {
+  json_file <- fname
+  json_file |> readLines(warn = FALSE) |> 
+    paste(collapse = "") |> 
+    parse_custom_json()
+}
+
+```
+
+### Delta Experiments
+
+```{r}
+
+process_file_delta <- function(fname, experiment) {
+  fname_short <- str_sub(fname, -8,-5)
+  
+  this_data <- read_one_file(fname)
+  
+  iterations <- length(this_data[["lblp_lower"]])
+  final_size_time <- this_data[["final_sizes"]][["timeGraph"]]
+  final_size_ng <- this_data[["final_sizes"]][["ngGraph"]]
+  
+  # Create the data frames
+  iter_data <- iter_data_ng(this_data)
+  ng_graph <- retrieve_ng_graph(this_data)
+  time_graph <- retrieve_time_graph(this_data)
+  customer_graph <- customer_graph(time_graph)  # Fixed reference
+  
+  # Return a list of results for this file
+  list(
+    metadata = tibble(
+      instance = fname_short,
+      experiment = experiment,
+      iterations = iterations,
+      #final_size_cap = final_size_cap,
+      final_size_time = final_size_time,
+      final_size_ng = final_size_ng
+    ),
+    iter_data = iter_data,
+    ng_graph = ng_graph,
+    time_graph = time_graph,
+    customer_graph = customer_graph
+  )
+}
+
+delta_experiment_results <- function(experiment) {
+  directory_path <- here(glue("out_r100_50_{experiment}_delta"))
+  flist <- dir_ls(path=directory_path)
+  options(dplyr.summarise.inform = FALSE)
+
+  # Process all files
+  all_results <- map(flist, process_file_delta, experiment)
+  
+  # Combine metadata into a single tibble
+  metadata <- map_dfr(all_results, "metadata")
+  
+  # Store the data frames separately
+  metadata$iter_data_list <- map(all_results, "iter_data")
+  metadata$ng_graph_list <- map(all_results, "ng_graph")
+  metadata$time_graph_list <- map(all_results, "time_graph")
+  metadata$customer_graph_list <- map(all_results, "customer_graph")
+  
+  # Compute statistics
+  metadata$ng_graph_rows <- map_int(metadata$ng_graph_list, nrow)
+  
+  metadata
+}
+
+
+```
